@@ -227,10 +227,11 @@ At the end of Low Level Design, the following deliverables must be complete:
 |-------------|-------------|
 | **Complete Class Diagram** | Full UML class diagram showing all classes, their attributes, methods, and relationships |
 | **Interface Definitions** | All abstractions defined as interfaces to enable loose coupling and testability |
-| **SOLID Compliance** | Design must adhere to SOLID principles (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion) |
+| **SOLID Compliance** | Design must adhere to SOLID principles (Single Responsibility, Open/Closed, Liskov Substitution, Interface Segregation, Dependency Inversion). Favor composition over inheritance |
 | **OOD Best Practices** | Follow established Object-Oriented Design patterns and principles |
 | **Modularity** | Components designed for independent development, testing, and deployment |
 | **Flexibility** | Architecture supports extension and modification without breaking existing functionality |
+| **Testability** | Design clear interfaces so that components can be mocked |
 
 **Design Principles Checklist:**
 

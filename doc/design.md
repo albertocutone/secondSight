@@ -913,21 +913,21 @@ Based on the comparison, the **hybrid open-source approach** is recommended for 
 ```mermaid
 flowchart LR
     subgraph FACE["😐 Face Pipeline"]
-        MP_FACE["MediaPipe Face Mesh<br/>(468 landmarks)"]
-        IBUG["OpenIBUG AU Detector<br/>(12-18 AUs)"]
+        MP_FACE["MediaPipe Face Mesh"]
+        IBUG["OpenIBUG AU Detector"]
         MP_FACE --> IBUG
     end
 
     subgraph BODY["🧍 Body Pipeline"]
-        MP_BODY["MediaPipe Holistic<br/>(33 pose + hands)"]
+        MP_BODY["MediaPipe Holistic"]
     end
 
     subgraph GAZE["👁️ Gaze Pipeline"]
-        ARIA["Aria ET / RGB Gaze<br/>(yaw, pitch)"]
+        ARIA["Aria ET / RGB Gaze"]
     end
 
     subgraph AUDIO["🎤 Audio Pipeline"]
-        LIBROSA["Librosa Features<br/>(pitch, tempo, energy)"]
+        LIBROSA["Librosa Features"]
     end
 
     FACE --> FUSION["Signal Fusion"]
