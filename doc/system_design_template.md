@@ -38,11 +38,12 @@ This section defines **how** this document should be written and maintained to e
 
 ### General Writing Style
 
-- Use **clear, concise, and unambiguous language**. Be objective and critical in your writing, do not accept ideas or information at face value.
+- Use **clear, concise, and unambiguous language**. Be objective and critical in your writing, do not accept ideas or information at face value. Avoid being verbose unless clearly specified.
 - Prefer **bullet points** over long paragraphs
 - Highlight **key terms** in **bold**
 - Use **tables** for comparisons, trade-offs, and structured data
 - Keep sections **self-contained** so they can be read and updated independently
+- When possible, keep designs **language-neutral** and prefer **UML diagrams** using Mermaid.
 
 ### Diagrams & Visuals
 
@@ -216,7 +217,14 @@ PUT  /api/v2/users/{id}/privacy-settings
 <details id="3-low-level-design">
 <summary><strong>3. Low Level Design</strong></summary>
 
-This section provides detailed technical design, including class diagrams, interface definitions, and technology choices.
+This section outlines the detailed technical design, covering class diagrams, interface definitions, and technology selections.
+Each subsection must conclude with:
+
+- Class diagram
+- Sequence diagram
+- Complete data model
+
+Avoid including code unless explicitly requested.
 
 <details id="31-low-level-design-goals">
 <summary><strong>3.1 Low Level Design Goals</strong></summary>

@@ -10,9 +10,20 @@
 - [2. High-Level Design](#2-high-level-design)
 - [3. Data Model](#3-data-model)
 - [4. Low Level Design](#4-low-level-design)
-  - [4.1 Device Compatibility & Hardware Abstraction](#41-device-compatibility--hardware-abstraction)
-  - [4.2 Perception Models](#42-perception-models)
-  - [4.3 Raw Data Storage (Mode-Gated)](#43-raw-data-storage-mode-gated)
+  - [4.1 Device Compatibility & Hardware Abstraction](./low-level-design/4.1-device-compatibility.md)
+  - [4.2 Pre-processing Pipeline](./low-level-design/4.2-pre-processing.md)
+  - [4.3 Feature Extraction](./low-level-design/4.3-feature-extraction.md)
+  - [4.4 Perception Models](./low-level-design/4.4-perception-models.md)
+  - [4.5 Signal Fusion](./low-level-design/4.5-signal-fusion.md)
+  - [4.6 Temporal Aggregation](./low-level-design/4.6-temporal-aggregation.md)
+  - [4.7 Policy Gate](./low-level-design/4.7-policy-gate.md)
+  - [4.8 User Feedback & Cue Rendering](./low-level-design/4.8-user-feedback.md)
+  - [4.9 User Settings & Controls](./low-level-design/4.9-user-settings.md)
+  - [4.10 Operating Modes](./low-level-design/4.10-operating-modes.md)
+  - [4.11 Raw Data Storage (Mode-Gated)](./low-level-design/4.11-raw-data-storage.md)
+  - [4.12 Privacy & Consent UX](./low-level-design/4.12-privacy-consent-ux.md)
+  - [4.13 Performance & Latency Budgets](./low-level-design/4.13-performance-latency.md)
+  - [4.14 Error Handling & Graceful Degradation](./low-level-design/4.14-error-handling.md)
 - [Appendix A: Signal Vocabulary](#appendix-a-signal-vocabulary)
 - [Appendix B: Facial Action Units (FAUs) Reference](#appendix-b-facial-action-units-faus-reference)
 - [Appendix C: Terminology](#appendix-c-terminology)
@@ -708,926 +719,198 @@ This section provides detailed technical design, including class diagrams, inter
 
 - Exact latency budgets per pipeline stage
 
+---
+
+## Tech Stack
+
+### Device × Component Matrix
+
+| Component | Artemis (P0) | Ray-Ban (P1) | Quest (P2) | Android (P3) |
+|-----------|:------------:|:------------:|:----------:|:------------:|
+| **C++ Core** | ✅ | ✅ | ✅ | ✅ |
+| **Ocean CV** | ✅ | ✅ | ✅ | ✅ |
+| **TFLite / ONNX** | ✅ | ✅ | ✅ | ✅ |
+| **Platform SDK** | Spatial SDK | Wearables SDK | Spatial SDK | NDK |
+| **UI Layer** | Spatial SDK (Kotlin) | Wearables SDK (C++) | Spatial SDK (Kotlin) | Android Views |
+| **Audio** | Oboe | Oboe | Oboe | Oboe |
+| **Bridge** | JNI | C ABI | JNI | JNI |
+| **IDE** | Android Studio | VS Code / Xcode | Android Studio | Android Studio |
+| **Build** | Gradle + CMake | CMake | Gradle + CMake | Gradle + CMake |
+| **Status** | 🔮 Future (2027) | ✅ Available | ✅ Available | ✅ Available |
+
+> **Note:** Using Spatial SDK for both Quest and Artemis enables UI code reuse. Ray-Ban requires separate Wearables SDK (no Spatial SDK support). For Quest, **Ocean OpenXR** is an alternative if a pure C++ solution is preferred (no Kotlin layer).
+
+### Architecture Overview
+
+```mermaid
+flowchart TB
+    subgraph PLATFORM["Platform UI Layer"]
+        direction LR
+        SPATIAL["Spatial SDK<br/>(Artemis/Quest)"]
+        WEARABLES["Wearables SDK<br/>(Ray-Ban)"]
+        ANDROID["Android Views<br/>(Phone)"]
+    end
+
+    BRIDGE["JNI / C ABI Bridge"]
+
+    subgraph CORE["C++ Core (Portable)"]
+        direction TB
+        ORCH["Pipeline Orchestrator"]
+
+        subgraph PROCESSING["Processing"]
+            direction LR
+            PRE["Pre-process<br/>(Ocean CV)"]
+            FEAT["Features<br/>(Ocean)"]
+            ML["ML Inference<br/>(TFLite)"]
+            FUSE["Fusion"]
+        end
+
+        subgraph HAL["Hardware Abstraction"]
+            direction LR
+            CAM["Camera"]
+            IMU["IMU"]
+            MIC["Mic"]
+        end
+    end
+
+    PLATFORM --> BRIDGE
+    BRIDGE --> ORCH
+    ORCH --> PROCESSING
+    PROCESSING --> HAL
+
+    style PLATFORM fill:#0066cc,stroke:#000,color:#fff
+    style BRIDGE fill:#cc6600,stroke:#000,color:#fff
+    style CORE fill:#006600,stroke:#000,color:#fff
+    style PROCESSING fill:#004400,stroke:#000,color:#fff
+    style HAL fill:#333,stroke:#fff,color:#fff
+```
+
+### Bridge Interface (C ABI)
+
+```cpp
+extern "C" {
+    int secondsight_poll_cues(SafeCueC* out_cues, int max_cues);
+    void secondsight_set_enabled(bool enabled);
+    void secondsight_set_mode(int mode);
+    void secondsight_set_feedback_intensity(float intensity);
+    void secondsight_emergency_disable(void);
+    int secondsight_init(const char* config_path);
+    void secondsight_shutdown(void);
+}
+
+typedef struct {
+    int64_t timestamp_ns;
+    int cue_type;
+    float salience;
+    int modality;
+} SafeCueC;
+```
+
+### Migration Path
+
+| Phase | Timeline | Focus |
+|-------|----------|-------|
+| **Phase 1** | Now | C++ core + Ocean + TFLite, Quest via OpenXR |
+| **Phase 2** | +3 months | Ray-Ban via Wearables SDK |
+| **Phase 3** | 2027+ | Artemis via Meta Spatial SDK |
+
+---
+
 <details id="41-device-compatibility--hardware-abstraction">
 <summary><strong>4.1 Device Compatibility & Hardware Abstraction</strong></summary>
 
-#### Supported Devices
-
-| Device Class | Examples | Primary Use Case |
-|--------------|----------|------------------|
-| **VR Headsets** | Meta Quest 3, Quest Pro | Immersive training, research mode |
-| **Smart Glasses** | Ray-Ban Meta | Everyday assistive use |
-| **Smartphones** | Android devices | Accessible entry point, training mode |
-
-#### Platform-Specific Tech Stacks
-
-SecondSight supports two distinct platform families with different underlying SDKs:
-
-| Platform Family | Devices | SDK / Framework | Key Capabilities |
-|-----------------|---------|-----------------|------------------|
-| **VR Devices** | Quest 3, Quest Pro | **OpenXR** | Full body tracking, hand tracking, face tracking, eye tracking, spatial anchors |
-| **Wearables & Mobile** | Ray-Ban Meta glasses, Android smartphones | [**Meta Wearables Device Access Toolkit**](https://developers.meta.com/blog/introducing-meta-wearables-device-access-toolkit/) | Camera access, IMU, microphone, limited compute |
-
-> **Reference:**
-
-#### Hardware Abstraction Layer (HAL)
-
-Despite different platform SDKs, the **Perception Layer receives identical input** regardless of device. This is achieved through a Hardware Abstraction Layer (HAL) that normalizes sensor data.
-
-```mermaid
-flowchart TB
-    subgraph DEVICES["Device Layer"]
-        direction LR
-        VR["🥽 VR Headsets<br/>(OpenXR)"]
-        GLASSES["🕶️ Smart Glasses<br/>(Wearables SDK)"]
-        PHONE["📱 Smartphones<br/>(Wearables SDK)"]
-    end
-
-    subgraph HAL["Hardware Abstraction Layer"]
-        direction TB
-        VR_ADAPTER["OpenXR Adapter"]
-        WEAR_ADAPTER["Wearables SDK Adapter"]
-        NORMALIZER["Sensor Normalizer"]
-    end
-
-    subgraph PERCEPTION["🧠 Perception Layer"]
-        UNIFIED["Unified SensorFrame"]
-    end
-
-    VR --> VR_ADAPTER
-    GLASSES --> WEAR_ADAPTER
-    PHONE --> WEAR_ADAPTER
-    VR_ADAPTER --> NORMALIZER
-    WEAR_ADAPTER --> NORMALIZER
-    NORMALIZER --> UNIFIED
-
-    style HAL fill:#663399,stroke:#000,stroke-width:2px,color:#fff
-    style VR_ADAPTER fill:#4d2673,stroke:#000,color:#fff
-    style WEAR_ADAPTER fill:#4d2673,stroke:#000,color:#fff
-    style NORMALIZER fill:#336699,stroke:#000,color:#fff
-    style PERCEPTION fill:#0066cc,stroke:#000,stroke-width:2px,color:#fff
-    style UNIFIED fill:#004d99,stroke:#000,color:#fff
-    style DEVICES fill:#1a1a1a,stroke:#fff,stroke-width:2px,color:#fff
-```
-
-#### HAL Design Principles
-
-| Principle | Description |
-|-----------|-------------|
-| **Uniform Input Contract** | All platform adapters produce the same `SensorFrame` structure |
-| **Graceful Degradation** | Missing sensors are represented as null/optional; Perception layer handles absence |
-| **Quality Metadata** | Each adapter reports sensor quality scores for downstream reliability weighting |
-| **No Platform Leakage** | Perception layer code has zero knowledge of underlying SDK |
-
-#### Sensor Availability by Device
-
-| Sensor | Quest 3/Pro | Ray-Ban Meta | Android Phone | Notes |
-|--------|-------------|--------------|---------------|-------|
-| **RGB Camera** | ✅ Full | ✅ Limited FOV | ✅ Full | Extract RGB from passthrough/front-facing cameras |
-| **Face Tracking** | ✅ Quest Pro (native FAUs) | ❌ ML models | ❌ ML models | Native: HAL maps to FAU vector; ML: Perception layer runs inference |
-| **Body Tracking** | ✅ Native keypoints | ❌ ML models | ❌ ML models | Native: HAL converts XR body pose; ML: Perception layer runs inference |
-| **Hand Tracking** | ✅ Native pose + gestures | ⚠️ Limited | ❌ ML models | Native: HAL extracts hand pose; ML: Perception layer runs inference |
-| **IMU** | ✅ Head tracking | ✅ Accel + Gyro | ✅ Accel + Gyro | Normalized to IMU-equivalent for motion compensation |
-| **Microphone** | ✅ | ✅ | ✅ | Extract audio buffer for prosody analysis (UserB speech) |
-
-> **Note:** When native tracking is unavailable (❌), the Perception layer runs on-device ML models on camera frames. This is more compute-intensive but produces equivalent `SensorFrame` data. All tracking (face, body, hand) refers to **UserB** — the observed person.
-
-#### Implications for Perception Layer
-
-| Scenario | Behavior |
-|----------|----------|
-| VR with native face tracking | HAL provides pre-computed FAUs → Face Feature Extraction bypassed |
-| Glasses without native tracking | HAL provides raw frames → Face/Body models run full pipeline |
-| Phone in training mode | HAL provides raw frames + audio → Full ML inference |
-| Any device with degraded sensor | HAL sets low `signal_quality` → Perception layer applies higher uncertainty |
+📄 **See dedicated document:** [4.1-device-compatibility.md](./low-level-design/4.1-device-compatibility.md)
 
 </details>
 
-<details id="42-perception-models">
-<summary><strong>4.2 Perception Models</strong></summary>
+<details id="42-pre-processing-pipeline">
+<summary><strong>4.2 Pre-processing Pipeline</strong></summary>
 
-This section evaluates model options
-
-This section evaluates model options for the core perception pipeline. SecondSight requires on-device, real-time inference for facial action units, body pose, gaze estimation, and audio prosody.
-
-#### Evaluation Criteria
-
-| Criterion | Weight | Description |
-|-----------|--------|-------------|
-| **On-Device Capability** | Critical | Must run locally; no cloud dependency |
-| **Real-Time Performance** | Critical | ≥15 FPS on target devices (Quest, Ray-Ban Meta, Android) |
-| **FAU/Signal Output** | Critical | Must output observable signals, not emotion labels |
-| **Model Size** | High | <100MB preferred for mobile/XR deployment |
-| **License** | High | Permissive (MIT, Apache 2.0); no GPL/AGPL |
-| **Privacy** | High | No data exfiltration; inference-only |
-| **Accuracy** | Medium | Good enough for assistive cues; not clinical-grade |
-| **Fine-Tuning** | Medium | Ability to adapt to diverse populations |
-
-#### Solution Options Overview
-
-```mermaid
-flowchart TB
-    subgraph OPTIONS["Perception Model Options"]
-        direction TB
-        COMMERCIAL["💰 Commercial SDKs"]
-        OPENSOURCE["🆓 Open-Source Models"]
-        CUSTOM["🔧 Custom Implementation"]
-    end
-
-    subgraph COMMERCIAL_LIST["Commercial"]
-        AFF["Affectiva/Smart Eye"]
-        VISAGE["Visage Technologies"]
-        NOLDUS["Noldus FaceReader"]
-    end
-
-    subgraph OPENSOURCE_LIST["Open-Source"]
-        MP["MediaPipe Holistic"]
-        IBUG["OpenIBUG AU Detection"]
-        ARIA["Aria ET (Gaze)"]
-    end
-
-    subgraph CUSTOM_LIST["Custom"]
-        CUST["Train from scratch"]
-    end
-
-    COMMERCIAL --> COMMERCIAL_LIST
-    OPENSOURCE --> OPENSOURCE_LIST
-    CUSTOM --> CUSTOM_LIST
-
-    style COMMERCIAL fill:#996600,stroke:#000,color:#fff
-    style OPENSOURCE fill:#006600,stroke:#000,color:#fff
-    style CUSTOM fill:#660066,stroke:#000,color:#fff
-```
-
-#### Commercial SDK Comparison
-
-| SDK | Status | Pricing | On-Device | FAU Support | Body/Pose | Real-Time | Privacy | Notes |
-|-----|--------|---------|-----------|-------------|-----------|-----------|---------|-------|
-| **Affectiva/Smart Eye** | ✅ Active (acquired 2021) | Per-seat license | ✅ Yes | ✅ 21 AUs | ❌ No | ✅ Yes | ✅ On-device option | Industry leader; automotive focus |
-| **iMotions** | ✅ Active | Annual subscription | ❌ Cloud platform | ✅ Uses Affectiva (21 AUs) | ❌ Integrates 3P | ✅ Yes | ⚠️ Cloud-based | Research platform; sensor integration |
-| **Noldus FaceReader** | ✅ Active | Per-seat license | ✅ Local | ✅ FACS-based | ❌ Limited | ✅ Yes | ✅ On-premise | Academic focus |
-| **Visage Technologies** | ✅ Active | Custom licensing | ✅ Yes | ✅ FACS-based | ⚠️ Limited | ✅ Yes | ✅ Privacy-focused | Unity integration; mobile SDK |
-| **Kairos** | ✅ Active | Usage-based API | ❌ Cloud-only | ⚠️ Limited | ❌ No | ✅ Yes | ⚠️ Cloud | Privacy concerns |
-| **Amazon Rekognition** | ✅ Active | Pay-per-use | ❌ Cloud-only | ⚠️ Emotions only | ❌ No | ✅ Yes (video) | ⚠️ AWS | Not FAU-based |
-| **Google Cloud Vision** | ✅ Active | Pay-per-use | ❌ Cloud-only | ❌ Detection only | ❌ No | ✅ Yes | ⚠️ Cloud | No emotion/FAU output |
-| **Microsoft Azure Face** | ❌ **Deprecated** (2023) | — | — | — | — | — | — | Retired due to responsible AI concerns |
-| **RealEyes** | ✅ Active | Enterprise license | ❌ Cloud | ⚠️ Attention only | ❌ No | ✅ Yes | ⚠️ Cloud | Attention measurement focus |
-
-#### Open-Source Model Comparison
-
-| Model | License | Size | Speed | Platforms | Output | On-Device | Maintenance |
-|-------|---------|------|-------|-----------|--------|-----------|-------------|
-| **MediaPipe Holistic** | Apache 2.0 | ~15MB | 30-60 FPS | TFLite, ONNX, Web | 540+ keypoints (face + body + hands) | ✅ Yes | ✅ Active (Google) |
-| **OpenIBUG AU Detection** | MIT | ~100MB | 25-30 FPS | PyTorch, ONNX | 12-18 Action Units | ✅ Yes | ✅ Active (academic) |
-| **Aria ET (Gaze)** | MIT | ~50MB | 10 FPS | PyTorch, ONNX | Gaze yaw/pitch + vergence | ✅ Yes | ✅ Active (Meta) |
-| **BlazePose GHUM** | Apache 2.0 | ~10MB | 30 FPS | TFLite | 33 body keypoints | ✅ Yes | ✅ Active (Google) |
-| **OpenPose** | Apache 2.0 | ~200MB | 5-10 FPS | C++, Python (GPU) | Multi-person pose | ⚠️ GPU only | ⚠️ Slower updates |
-| **MoveNet** | Apache 2.0 | ~5MB | 50+ FPS | TFLite | 17 body keypoints | ✅ Yes | ✅ Active (Google) |
-| **Wav2Vec2** | MIT | ~300MB | 10 FPS | PyTorch, HF | Audio embeddings | ⚠️ Needs quant | ✅ Active (Meta) |
-
-#### Full Solution Comparison (Including Custom)
-
-| Criterion | Commercial (Affectiva) | Open-Source (MediaPipe + OpenIBUG) | Custom Implementation |
-|-----------|------------------------|-------------------------------------|----------------------|
-| **Development Cost** | 🟩 Low (SDK integration) | 🟨 Medium (integration + tuning) | 🟥 High (R&D + training) |
-| **Licensing Cost** | 🟥 High (per-seat) | 🟩 Free (MIT/Apache) | 🟩 Free |
-| **Time to MVP** | 🟩 Fast (weeks) | 🟨 Medium (1-2 months) | 🟥 Slow (6+ months) |
-| **On-Device** | 🟩 Yes | 🟩 Yes | 🟩 Yes |
-| **FAU Output** | 🟩 21 AUs | 🟩 12-18 AUs | 🟩 Customizable |
-| **Body Tracking** | 🟥 No (separate SDK) | 🟩 Yes (MediaPipe) | 🟩 Customizable |
-| **Gaze Estimation** | 🟨 Limited | 🟩 Yes (Aria ET) | 🟩 Customizable |
-| **Audio Prosody** | 🟥 No | 🟨 Partial (Wav2Vec2) | 🟩 Customizable |
-| **Model Size** | 🟨 ~100MB | 🟩 ~50-100MB combined | 🟨 Variable |
-| **Fine-Tuning** | 🟥 No (black box) | 🟩 Yes | 🟩 Full control |
-| **Bias Control** | 🟥 No control | 🟨 Retrain possible | 🟩 Full control |
-| **Privacy** | 🟩 On-device option | 🟩 On-device | 🟩 On-device |
-| **Vendor Lock-in** | 🟥 High | 🟩 None | 🟩 None |
-| **Long-term Maintenance** | 🟨 Vendor-dependent | 🟨 Community-dependent | 🟥 Self-maintained |
-
-**Legend:** 🟩 Strong | 🟨 Acceptable | 🟥 Weak
-
-#### Recommended Architecture
-
-Based on the comparison, the **hybrid open-source approach** is recommended for SecondSight:
-
-```mermaid
-flowchart LR
-    subgraph FACE["😐 Face Pipeline"]
-        MP_FACE["MediaPipe Face Mesh"]
-        IBUG["OpenIBUG AU Detector"]
-        MP_FACE --> IBUG
-    end
-
-    subgraph BODY["🧍 Body Pipeline"]
-        MP_BODY["MediaPipe Holistic"]
-    end
-
-    subgraph GAZE["👁️ Gaze Pipeline"]
-        ARIA["Aria ET / RGB Gaze"]
-    end
-
-    subgraph AUDIO["🎤 Audio Pipeline"]
-        LIBROSA["Librosa Features"]
-    end
-
-    FACE --> FUSION["Signal Fusion"]
-    BODY --> FUSION
-    GAZE --> FUSION
-    AUDIO --> FUSION
-
-    style FACE fill:#004d99,stroke:#000,color:#fff
-    style BODY fill:#006600,stroke:#000,color:#fff
-    style GAZE fill:#660066,stroke:#000,color:#fff
-    style AUDIO fill:#996600,stroke:#000,color:#fff
-    style FUSION fill:#cc6600,stroke:#000,color:#fff
-```
-
-| Component | Model | Size | License | Priority |
-|-----------|-------|------|---------|----------|
-| **Face Landmarks** | MediaPipe Face Mesh | 15MB | Apache 2.0 | P0 |
-| **Facial Action Units** | OpenIBUG AU Detection | 100MB | MIT | P0 |
-| **Body Pose** | MediaPipe Holistic | 10MB | Apache 2.0 | P0 |
-| **Hand Tracking** | MediaPipe Hands | 5MB | Apache 2.0 | P1 |
-| **Gaze Estimation** | Aria ET / RGB Gaze | 50MB | MIT | P0 |
-| **Audio Features** | Librosa + MLP | 5MB | BSD | P1 |
-| **Total** | — | **~185MB** | — | — |
-
-#### Rationale for Open-Source Approach
-
-| Factor | Decision |
-|--------|----------|
-| **Cost** | No licensing fees; critical for research/non-profit use cases |
-| **Privacy** | Full on-device; no vendor telemetry |
-| **Flexibility** | Can fine-tune for demographic fairness |
-| **Body Tracking** | Commercial face SDKs don't include body; would need two vendors |
-| **Transparency** | Open weights enable bias auditing |
-| **Vendor Risk** | Microsoft deprecated Azure Face API; Affectiva was acquired |
-| **Signals-Only** | Can ensure FAU output, not emotion labels (harder with black-box SDKs) |
-
-#### When to Consider Commercial SDK
-
-| Scenario | Recommendation |
-|----------|----------------|
-| Faster time-to-market required | Consider Affectiva for face + MediaPipe for body |
-| Enterprise support needed | Visage Technologies offers good support |
-| Automotive/embedded focus | Smart Eye (Affectiva) has automotive expertise |
-| No ML expertise on team | Commercial SDK reduces ML burden |
-
-#### Model Deployment Strategy
-
-| Phase | Focus | Models |
-|-------|-------|--------|
-| **Phase 1 (MVP)** | Core signals | MediaPipe Holistic + OpenIBUG AU |
-| **Phase 2 (Enhanced)** | Gaze + audio | Add Aria ET + Librosa features |
-| **Phase 3 (Production)** | Optimization | Quantization (TFLite, ONNX), model pruning |
-| **Phase 4 (Custom)** | Fine-tuning | Retrain on diverse datasets for fairness |
-
-#### Perception Model Open Questions (TBD)
-
-- [ ] Benchmark OpenIBUG AU vs MediaPipe Blendshapes for signal quality
-- [ ] Evaluate Aria ET performance on RGB (vs IR eye tracking)
-- [ ] Test combined model size and latency on Ray-Ban Meta
-- [ ] Assess demographic bias in selected models
+📄 **See dedicated document:** [4.2-pre-processing.md](./low-level-design/4.2-pre-processing.md)
 
 </details>
 
-<details id="43-raw-data-storage-mode-gated">
-<summary><strong>4.3 Raw Data Storage (Mode-Gated)</strong></summary>
-
-> ⚠️ **Raw data storage availability depends on the operating mode. Each mode has different storage policies based on its purpose.**
-
-Raw data storage is gated by **operating mode**. This reflects the reality that storage requirements differ based on user intent and use case.
-
-#### Storage Policies by Mode
-
-| Mode | Storage Allowed | Consent Required | Data Retention | Use Case |
-|------|-----------------|------------------|----------------|----------|
-| **Assistive** | ❌ None | — | — | Real-time feedback only; privacy-first |
-| **Training** | ⚠️ Session summaries only | Implicit (mode selection) | Session-scoped (auto-delete on exit) | Self-improvement; no raw media |
-| **Research** | ✅ Full (opt-in) | Explicit consent dialog | Configurable (default: 30 days) | Model development, evaluation, labeling |
-
-#### Purpose by Mode
-
-**Assistive Mode** — No storage. Ephemeral processing only.
-- Real-time perception and feedback
-- Privacy-maximizing: nothing persists beyond the current frame
-- Default mode for everyday use
-
-**Training Mode** — Session summaries only. No raw media.
-- Post-session reflection and self-improvement
-- Stores aggregated statistics (e.g., "attention patterns over time")
-- No raw camera frames, audio, or sensor data
-- Auto-deleted when session ends
-
-**Research Mode** — Full storage with explicit consent.
-| Use Case | Description |
-|----------|-------------|
-| **Model Training** | Collect labeled examples for training/fine-tuning perception models |
-| **Offline Evaluation** | Run pipeline on recorded data to measure accuracy, latency, regressions |
-| **Debugging** | Reproduce issues by replaying exact sensor inputs |
-| **A/B Testing** | Compare model versions on identical input data |
-
-#### What Gets Stored
-
-```mermaid
-flowchart LR
-    subgraph STORAGE["📦 Raw Data Storage"]
-        direction TB
-        SENSOR["SensorFrame"]
-        PROC["ProcessedFrame"]
-        FEAT["Feature Vectors"]
-        SIG["Signal Outputs"]
-        META["Session Metadata"]
-    end
-
-    subgraph PIPELINE["Pipeline"]
-        S["Sensors"] --> P["Pre-proc"] --> F["Features"] --> I["Inference"]
-    end
-
-    S -.->|tap| SENSOR
-    P -.->|tap| PROC
-    F -.->|tap| FEAT
-    I -.->|tap| SIG
-
-    style STORAGE fill:#993300,stroke:#ff6600,stroke-width:2px,color:#fff
-    style SENSOR fill:#663300,stroke:#000,color:#fff
-    style PROC fill:#663300,stroke:#000,color:#fff
-    style FEAT fill:#663300,stroke:#000,color:#fff
-    style SIG fill:#663300,stroke:#000,color:#fff
-    style META fill:#663300,stroke:#000,color:#fff
-```
-
-| Data Type | Contents | Storage Format |
-|-----------|----------|----------------|
-| `SensorFrame` | Raw camera frames, IMU readings, audio chunks | Binary (frames as PNG/JPEG, IMU/audio as protobuf) |
-| `ProcessedFrame` | Stabilized frames, quality scores | Binary |
-| `FaceFeatureVector` | FAUs, gaze proxy, quality | Protobuf/JSON |
-| `BodyFeatureVector` | Pose keypoints, gestures, quality | Protobuf/JSON |
-| `SignalOutput` | Face/body signals with confidence | Protobuf/JSON |
-| `SessionMetadata` | Device info, timestamps, settings, annotations | JSON |
-
-#### Implementation Note: External Tools for Raw Media
-
-> **💡 Implementation Option:** For raw media capture (camera frames, audio), the `DataRecorder` implementation can delegate to external tools like **FFmpeg**, **GStreamer**, or platform-specific recorders. These tools provide efficient encoding, compression, and mature file handling.
->
-> The `DataRecorder` class remains the **API layer** responsible for:
-> - Mode-gating (blocking Assistive, limiting Training)
-> - Semantic data (feature vectors, signals, annotations)
-> - Session management (metadata, auto-delete policies)
-> - Privacy controls (consent, anonymization)
->
-> This hybrid approach combines external tool efficiency with SecondSight's semantic recording requirements.
-
-#### Storage API
-
-**DataRecorder** — Mode-gated class for capturing pipeline data. Enforces storage policies based on operating mode.
-
-##### Sequence Diagram — Recording Session Lifecycle
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant DR as DataRecorder
-    participant FS as FileSystem
-    participant Pipeline as Perception Pipeline
-
-    Note over App,Pipeline: Session Start
-    App->>DR: new DataRecorder(mode, config)
-    DR->>DR: validate mode (reject Assistive)
-    DR->>DR: validate config against mode
-    App->>DR: start_session("session_001")
-    DR->>FS: create session directory
-    DR->>FS: write metadata.json
-    DR-->>App: session started
-
-    Note over App,Pipeline: Recording Loop
-    loop Every Frame (~33ms)
-        Pipeline->>DR: record_sensor_frame(frame)
-        alt Research Mode
-            DR->>FS: write raw frame
-        else Training Mode
-            DR->>DR: extract summary stats only
-        end
-        Pipeline->>DR: record_features(face, body)
-        DR->>FS: write feature vectors
-        Pipeline->>DR: record_signals(signals)
-        DR->>FS: write signal outputs
-    end
-
-    Note over App,Pipeline: Optional: Pause/Resume
-    App->>DR: pause()
-    DR-->>App: recording paused
-    Note right of DR: Frames discarded while paused
-    App->>DR: resume()
-    DR-->>App: recording resumed
-
-    Note over App,Pipeline: Session End
-    App->>DR: end_session()
-    DR->>DR: flush buffers
-    DR->>FS: finalize metadata
-    DR-->>App: SessionSummary
-```
-
-##### Sequence Diagram — Export Flow (Research Mode Only)
-
-```mermaid
-sequenceDiagram
-    participant User as User/App
-    participant DR as DataRecorder
-    participant Anon as Anonymizer
-    participant FS as FileSystem
-
-    User->>DR: export_session("session_001", options)
-    DR->>DR: check mode == Research
-    alt Not Research Mode
-        DR-->>User: ModeNotAllowedError
-    else Research Mode
-        DR->>FS: read session data
-        alt options.anonymize_faces
-            DR->>Anon: blur faces in frames
-            Anon-->>DR: anonymized frames
-        end
-        alt options.strip_audio
-            DR->>DR: remove audio buffers
-        end
-        DR->>FS: write export (zip/tar/dir)
-        DR-->>User: ExportResult
-    end
-```
-
-##### State Diagram — DataRecorder States
-
-```mermaid
-stateDiagram-v2
-    [*] --> Uninitialized
-
-    Uninitialized --> Ready: constructor(mode, config)
-    Uninitialized --> Error: mode == Assistive
-
-    Ready --> Recording: start_session()
-    Ready --> [*]: destructor
-
-    Recording --> Paused: pause()
-    Recording --> Ready: end_session()
-    Recording --> Recording: record_*()
-
-    Paused --> Recording: resume()
-    Paused --> Ready: end_session()
-
-    Error --> [*]
-
-    note right of Recording
-        Active recording
-        Frames saved to disk
-    end note
-
-    note right of Paused
-        Session active but
-        frames discarded
-    end note
-```
-
-##### Activity Diagram — Mode-Based Recording Behavior
-
-```mermaid
-flowchart TB
-    START((Start)) --> CHECK_MODE{Check Mode}
-
-    CHECK_MODE -->|Assistive| REJECT[❌ Reject: ModeNotAllowedError]
-    CHECK_MODE -->|Training| TRAINING_PATH
-    CHECK_MODE -->|Research| RESEARCH_PATH
-
-    subgraph TRAINING_PATH["Training Mode"]
-        T_SENSOR[record_sensor_frame] --> T_EXTRACT[Extract summary stats only]
-        T_EXTRACT --> T_STORE[Store aggregates]
-        T_FEATURES[record_features] --> T_STORE_FEAT[Store feature vectors]
-        T_SIGNALS[record_signals] --> T_STORE_SIG[Store signals]
-        T_ANNOT[add_annotation] --> T_NOOP[No-op: annotations disabled]
-    end
-
-    subgraph RESEARCH_PATH["Research Mode"]
-        R_SENSOR[record_sensor_frame] --> R_STORE_RAW[Store full raw frame]
-        R_FEATURES[record_features] --> R_STORE_FEAT[Store feature vectors]
-        R_SIGNALS[record_signals] --> R_STORE_SIG[Store signals]
-        R_ANNOT[add_annotation] --> R_STORE_ANNOT[Store annotation]
-    end
-
-    TRAINING_PATH --> SESSION_END[end_session]
-    RESEARCH_PATH --> SESSION_END
-
-    SESSION_END --> AUTO_DELETE{auto_delete_on_exit?}
-    AUTO_DELETE -->|Yes: Training default| DELETE[Delete session data]
-    AUTO_DELETE -->|No: Research default| KEEP[Keep session data]
-
-    DELETE --> DONE((Done))
-    KEEP --> DONE
-    REJECT --> DONE
-
-    style REJECT fill:#cc0000,stroke:#000,color:#fff
-    style TRAINING_PATH fill:#996600,stroke:#000,color:#fff
-    style RESEARCH_PATH fill:#006600,stroke:#000,color:#fff
-    style T_NOOP fill:#666666,stroke:#000,color:#fff
-```
-
-##### Usage Example — Research Mode Recording
-
-```mermaid
-sequenceDiagram
-    participant Lab as Research Lab App
-    participant DR as DataRecorder
-    participant UI as Consent UI
-
-    Note over Lab,UI: Setup with Consent
-    Lab->>UI: show consent dialog
-    UI-->>Lab: user consents
-    Lab->>DR: new DataRecorder(RESEARCH, config)
-    Lab->>DR: start_session("eval_20260111")
-
-    Note over Lab,UI: Controlled Recording
-    loop Evaluation Scenario
-        Lab->>DR: record_sensor_frame(frame)
-        Lab->>DR: record_features(face, body)
-        Lab->>DR: record_signals(signals)
-        Lab->>DR: add_annotation(ts, "ground_truth_smile")
-    end
-
-    Lab->>DR: end_session()
-    DR-->>Lab: SessionSummary{frames: 1800, duration: 60s}
-
-    Note over Lab,UI: Later: Export for Analysis
-    Lab->>DR: export_session("eval_20260111", {anonymize: true})
-    DR-->>Lab: ExportResult{path: "export.zip", size: 450MB}
-```
-
-##### Usage Example — Training Mode Self-Reflection
-
-```mermaid
-sequenceDiagram
-    participant User as User App
-    participant DR as DataRecorder
-    participant Summary as Session Summary
-
-    Note over User,Summary: Personal Training Session
-    User->>DR: new DataRecorder(TRAINING, config)
-    Note right of DR: auto_delete_on_exit = true (default)
-    User->>DR: start_session("practice_001")
-
-    loop Interaction Practice
-        User->>DR: record_features(face, body)
-        User->>DR: record_signals(signals)
-        Note right of DR: Only aggregates stored, no raw media
-    end
-
-    User->>DR: end_session()
-    DR-->>User: SessionSummary
-
-    User->>Summary: display reflection
-    Summary-->>User: "Avg attention: 72%, Posture shifts: 12"
-
-    Note over User,Summary: Session data auto-deleted
-    DR->>DR: delete session (auto)
-```
-
-##### Class Diagram
-
-```mermaid
-classDiagram
-    class DataRecorder {
-        -OperatingMode mode
-        -RecorderConfig config
-        -string sessionId
-        -bool active
-        -bool paused
-        -RecordingStats stats
-        +DataRecorder(mode, config)
-        +start_session(session_id) void
-        +end_session() SessionSummary
-        +record_sensor_frame(frame) void
-        +record_processed_frame(frame) void
-        +record_features(face, body) void
-        +record_signals(signals) void
-        +add_annotation(timestamp, label, metadata) void
-        +pause() void
-        +resume() void
-        +flush() void
-        +export_session(session_id, options) ExportResult
-        +delete_session(session_id) void
-        +is_active() bool
-        +is_paused() bool
-        +get_session_id() string
-        +get_mode() OperatingMode
-        +get_stats() RecordingStats
-    }
-
-    class RecorderConfig {
-        +bool capture_sensor_frames
-        +bool capture_processed_frames
-        +bool capture_features
-        +bool capture_signals
-        +bool capture_annotations
-        +int frame_rate_divisor
-        +int max_session_duration_s
-        +int max_storage_mb
-        +bool auto_delete_on_exit
-        +validate(mode) bool
-        +get_default_for_mode(mode) RecorderConfig
-    }
-
-    class RecordingStats {
-        +int frames_recorded
-        +int64 bytes_written
-        +float duration_s
-        +int dropped_frames
-        +get_storage_used_mb() float
-        +get_frame_rate() float
-        +reset() void
-    }
-
-    class SessionSummary {
-        +string session_id
-        +int total_frames
-        +float duration_s
-        +int64 storage_bytes
-        +timestamp start_time
-        +timestamp end_time
-        +get_avg_frame_rate() float
-    }
-
-    class ExportOptions {
-        +bool anonymize_faces
-        +bool strip_audio
-        +ExportFormat format
-        +bool include_metadata
-        +int jpeg_quality
-        +bool compress_output
-        +validate() bool
-    }
-
-    class ExportResult {
-        +string export_path
-        +int64 size_bytes
-        +bool success
-        +string error_message
-        +int files_exported
-        +float duration_s
-    }
-
-    class OperatingMode {
-        <<enumeration>>
-        ASSISTIVE
-        TRAINING
-        RESEARCH
-    }
-
-    class ExportFormat {
-        <<enumeration>>
-        ZIP
-        TAR
-        DIRECTORY
-    }
-
-    class SensorFrame {
-        <<input>>
-        +int64 timestamp_ns
-        +CameraFrame[] camera_frames
-        +DepthFrame depth_frame
-        +IMUReading imu_data
-        +AudioBuffer audio_chunk
-    }
-
-    class ProcessedFrame {
-        <<input>>
-        +int64 timestamp_ns
-        +RGBFrame stabilized_frame
-        +float signal_quality
-    }
-
-    class FaceFeatureVector {
-        <<input>>
-        +int64 timestamp_ns
-        +FAUVector facial_actions
-        +GazeEstimate gaze_proxy
-        +float face_quality
-    }
-
-    class BodyFeatureVector {
-        <<input>>
-        +int64 timestamp_ns
-        +PoseKeypoints pose
-        +HandKeypoints hand_pose
-        +HeadPose head_orientation
-        +float body_quality
-    }
-
-    class SignalOutput {
-        <<input>>
-        +int64 timestamp_ns
-        +SignalModality modality
-        +SignalType signal_type
-        +float intensity
-        +float reliability
-    }
-
-    DataRecorder "1" *-- "1" RecorderConfig : configured by
-    DataRecorder "1" *-- "1" RecordingStats : tracks
-    DataRecorder "1" --> "1" OperatingMode : operates in
-    DataRecorder ..> SessionSummary : returns
-    DataRecorder ..> ExportResult : returns
-    ExportOptions "1" --> "1" ExportFormat : uses
-    DataRecorder ..> ExportOptions : accepts
-
-    DataRecorder ..> SensorFrame : records
-    DataRecorder ..> ProcessedFrame : records
-    DataRecorder ..> FaceFeatureVector : records
-    DataRecorder ..> BodyFeatureVector : records
-    DataRecorder ..> SignalOutput : records
-
-    style DataRecorder fill:#004d99,stroke:#000,color:#fff
-    style RecorderConfig fill:#006600,stroke:#000,color:#fff
-    style RecordingStats fill:#663399,stroke:#000,color:#fff
-    style SessionSummary fill:#996600,stroke:#000,color:#fff
-    style ExportOptions fill:#660066,stroke:#000,color:#fff
-    style ExportResult fill:#996600,stroke:#000,color:#fff
-    style OperatingMode fill:#cc0000,stroke:#000,color:#fff
-    style ExportFormat fill:#666666,stroke:#000,color:#fff
-    style SensorFrame fill:#444444,stroke:#000,color:#fff
-    style ProcessedFrame fill:#444444,stroke:#000,color:#fff
-    style FaceFeatureVector fill:#004d99,stroke:#000,color:#fff
-    style BodyFeatureVector fill:#006600,stroke:#000,color:#fff
-    style SignalOutput fill:#cc6600,stroke:#000,color:#fff
-```
-
-```pseudo
-class DataRecorder:
-    """
-    Mode-gated data recorder for capturing pipeline data.
-    Only instantiable in Training or Research modes.
-    Assistive mode will raise ModeNotAllowedError.
-    """
-
-    # ─────────────────────────────────────────────────────────────
-    # LIFECYCLE
-    # ─────────────────────────────────────────────────────────────
-
-    constructor(mode: OperatingMode, config: RecorderConfig)
-        // Creates a new recorder for the given mode.
-        // Raises ModeNotAllowedError if mode is Assistive.
-        // Validates config against mode constraints (e.g., Training cannot store raw frames).
-
-    destructor()
-        // Auto-flushes pending data and closes file handles.
-        // Ensures no data loss on unexpected termination.
-
-    method start_session(session_id: string) -> void
-        // Begins a new recording session with the given ID.
-        // Creates session directory structure and metadata file.
-        // Raises SessionAlreadyActiveError if a session is in progress.
-
-    method end_session() -> SessionSummary
-        // Finalizes the current session, flushes all buffers, writes metadata.
-        // Returns summary with frame counts, duration, and storage used.
-        // Safe to call multiple times (idempotent).
-
-    # ─────────────────────────────────────────────────────────────
-    # STATE PROPERTIES
-    # ─────────────────────────────────────────────────────────────
-
-    property is_active: bool [readonly]
-        // True if a session is in progress and not paused.
-
-    property is_paused: bool [readonly]
-        // True if session is active but recording is paused.
-
-    property session_id: string? [readonly]
-        // Current session ID, or null if no session active.
-
-    property mode: OperatingMode [readonly]
-        // The operating mode this recorder was created with.
-
-    property stats: RecordingStats [readonly]
-        // Live statistics: frame count, bytes written, duration.
-
-    # ─────────────────────────────────────────────────────────────
-    # RECORDING METHODS (behavior depends on mode)
-    # ─────────────────────────────────────────────────────────────
-
-    method record_sensor_frame(frame: SensorFrame) -> void
-        // Records raw sensor data (camera, IMU, audio).
-        // Training mode: extracts and stores summary statistics only.
-        // Research mode: stores full raw frame if config allows.
-        // No-op if paused or no active session.
-
-    method record_processed_frame(frame: ProcessedFrame) -> void
-        // Records stabilized/pre-processed frame.
-        // Training mode: stores quality scores only.
-        // Research mode: stores full frame if config allows.
-
-    method record_features(face: FaceFeatureVector?, body: BodyFeatureVector?) -> void
-        // Records extracted feature vectors.
-        // Both modes: stores feature data (no raw media).
-
-    method record_signals(signals: List<SignalOutput>) -> void
-        // Records inference outputs with confidence scores.
-        // Both modes: stores signal data.
-
-    method add_annotation(timestamp_ns: int64, label: string, metadata: Map?) -> void
-        // Adds ground-truth label for offline evaluation.
-        // Used to mark events (e.g., "user smiled", "deception cue").
-        // Research mode only; no-op in Training mode.
-
-    # ─────────────────────────────────────────────────────────────
-    # CONTROL METHODS
-    # ─────────────────────────────────────────────────────────────
-
-    method pause() -> void
-        // Temporarily stops recording without ending session.
-        // Frames received while paused are discarded.
-
-    method resume() -> void
-        // Resumes recording after pause.
-
-    method flush() -> void
-        // Forces write of all buffered data to disk.
-        // Useful before long operations or checkpoints.
-
-    # ─────────────────────────────────────────────────────────────
-    # EXPORT METHODS (Research mode only)
-    # ─────────────────────────────────────────────────────────────
-
-    method export_session(session_id: string, options: ExportOptions) -> ExportResult
-        // Exports a recorded session to a portable format.
-        // Can apply anonymization (blur faces, strip audio).
-        // Raises ModeNotAllowedError if not in Research mode.
-
-    method delete_session(session_id: string) -> void
-        // Permanently deletes a recorded session.
-        // Requires explicit confirmation in config.
-```
-
-**RecorderConfig** — Controls what data is captured and storage limits.
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `capture_sensor_frames` | bool | Store raw camera/IMU/audio (Research only) |
-| `capture_processed_frames` | bool | Store stabilized frames |
-| `capture_features` | bool | Store feature vectors |
-| `capture_signals` | bool | Store inference outputs |
-| `capture_annotations` | bool | Allow ground-truth labeling (Research only) |
-| `frame_rate_divisor` | int | Store every Nth frame (1 = all, 10 = 10%) |
-| `max_session_duration_s` | int | Auto-stop after N seconds |
-| `max_storage_mb` | int | Stop if storage exceeds limit |
-| `auto_delete_on_exit` | bool | Delete session data when session ends (Training default) |
-
-**RecordingStats** — Live statistics during recording.
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `frames_recorded` | int | Total frames captured |
-| `bytes_written` | int64 | Storage used in bytes |
-| `duration_s` | float | Session duration in seconds |
-| `dropped_frames` | int | Frames skipped due to rate limiting or pause |
-
-**ExportOptions** — Controls session export behavior.
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `anonymize_faces` | bool | Blur detected faces in exported frames |
-| `strip_audio` | bool | Remove audio from export |
-| `format` | ExportFormat | Output format: `zip`, `tar`, `directory` |
-| `include_metadata` | bool | Include session metadata in export |
-
-#### File Structure
-
-```text
-/data/secondsight/dev/recordings/
-├── session_20260110_134500/
-│   ├── metadata.json           # Session info, device, config
-│   ├── sensor_frames/
-│   │   ├── 000001.png          # Raw camera frame
-│   │   ├── 000001.imu.pb       # IMU reading
-│   │   └── ...
-│   ├── processed_frames/
-│   │   ├── 000001.png
-│   │   └── ...
-│   ├── features/
-│   │   ├── 000001.face.json
-│   │   ├── 000001.body.json
-│   │   └── ...
-│   ├── signals/
-│   │   ├── 000001.json
-│   │   └── ...
-│   └── annotations.json        # Ground-truth labels
-```
-
-#### Privacy Considerations (Even in Dev)
-
-| Concern | Mitigation |
-|---------|------------|
-| **Bystander capture** | Recording sessions should be in controlled environments only |
-| **Data retention** | Auto-delete after configurable period (default: 30 days) |
-| **Data sharing** | Recordings stay on-device; explicit export required |
-| **Consent** | Dev builds display persistent "RECORDING" indicator |
-| **Anonymization** | Export tools can blur faces, strip audio before sharing |
+<details id="43-feature-extraction">
+<summary><strong>4.3 Feature Extraction</strong></summary>
+
+📄 **See dedicated document:** [4.3-feature-extraction.md](./low-level-design/4.3-feature-extraction.md)
+
+</details>
+
+<details id="44-perception-models">
+<summary><strong>4.4 Perception Models</strong></summary>
+
+📄 **See dedicated document:** [4.4-perception-models.md](./low-level-design/4.4-perception-models.md)
+
+</details>
+
+<details id="45-signal-fusion">
+<summary><strong>4.5 Signal Fusion</strong></summary>
+
+📄 **See dedicated document:** [4.5-signal-fusion.md](./low-level-design/4.5-signal-fusion.md)
+
+</details>
+
+<details id="46-temporal-aggregation">
+<summary><strong>4.6 Temporal Aggregation</strong></summary>
+
+📄 **See dedicated document:** [4.6-temporal-aggregation.md](./low-level-design/4.6-temporal-aggregation.md)
+
+</details>
+
+<details id="47-policy-gate">
+<summary><strong>4.7 Policy Gate</strong></summary>
+
+📄 **See dedicated document:** [4.7-policy-gate.md](./low-level-design/4.7-policy-gate.md)
+
+</details>
+
+<details id="48-user-feedback-cue-rendering">
+<summary><strong>4.8 User Feedback & Cue Rendering</strong></summary>
+
+📄 **See dedicated document:** [4.8-user-feedback.md](./low-level-design/4.8-user-feedback.md)
+
+</details>
+
+<details id="49-user-settings-controls">
+<summary><strong>4.9 User Settings & Controls</strong></summary>
+
+📄 **See dedicated document:** [4.9-user-settings.md](./low-level-design/4.9-user-settings.md)
+
+</details>
+
+<details id="410-operating-modes">
+<summary><strong>4.10 Operating Modes</strong></summary>
+
+📄 **See dedicated document:** [4.10-operating-modes.md](./low-level-design/4.10-operating-modes.md)
+
+</details>
+
+<details id="411-raw-data-storage-mode-gated">
+<summary><strong>4.11 Raw Data Storage (Mode-Gated)</strong></summary>
+
+📄 **See dedicated document:** [4.11-raw-data-storage.md](./low-level-design/4.11-raw-data-storage.md)
+
+</details>
+
+<details id="412-privacy-consent-ux">
+<summary><strong>4.12 Privacy & Consent UX</strong></summary>
+
+📄 **See dedicated document:** [4.12-privacy-consent-ux.md](./low-level-design/4.12-privacy-consent-ux.md)
+
+</details>
+
+<details id="413-performance-latency-budgets">
+<summary><strong>4.13 Performance & Latency Budgets</strong></summary>
+
+📄 **See dedicated document:** [4.13-performance-latency.md](./low-level-design/4.13-performance-latency.md)
+
+</details>
+
+<details id="414-error-handling-graceful-degradation">
+<summary><strong>4.14 Error Handling & Graceful Degradation</strong></summary>
+
+📄 **See dedicated document:** [4.14-error-handling.md](./low-level-design/4.14-error-handling.md)
 
 </details>
 
